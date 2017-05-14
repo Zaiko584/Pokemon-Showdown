@@ -6,35 +6,12 @@
  *
  * @license MIT license
  */
-'use strict';
 
-const fs = require('fs');
-const path = require('path');
+var fs = require('fs');
+var path = require('path');
 
-class TimedCounter extends Map {
-	increment(key, timeLimit) {
-		let val = this.get(key);
-		let now = Date.now();
-		if (!val || now > val[1] + timeLimit) {
-			this.set(key, [1, Date.now()]);
-			return [1, 0];
-		} else {
-			val[0]++;
-			return [val[0], now - val[1]];
-		}
-	}
-}
-
-// Config.loglevel is:
-// 0 = everything
-// 1 = debug (same as 0 for now)
-// 2 = notice (default)
-// 3 = warning
-// (4 is currently unused)
-// 5 = supposedly completely silent, but for now a lot of PS output doesn't respect loglevel
-if (Config.loglevel === undefined) Config.loglevel = 2;
-
-const Monitor = module.exports = {
+/* global Monitor: true */
+var Monitor = module.exports = {
 
 	/*********************************************************
 	 * Logging
@@ -42,161 +19,207 @@ const Monitor = module.exports = {
 
 	log: function (text) {
 		this.notice(text);
-		if (Rooms('staff')) {
-			Rooms('staff').add('|c|~|' + text).update();
+		if (Rooms.get('staff')) {
+			Rooms.get('staff').add('|c|~|' + text).update();
 		}
 	},
 	adminlog: function (text) {
 		this.notice(text);
-		if (Rooms('upperstaff')) {
-			Rooms('upperstaff').add('|c|~|' + text).update();
+		if (Rooms.get('upperstaff')) {
+			Rooms.get('upperstaff').add('|c|~|' + text).update();
 		}
 	},
 	logHTML: function (text) {
 		this.notice(text);
-		if (Rooms('staff')) {
-			Rooms('staff').add('|html|' + text).update();
+		if (Rooms.get('staff')) {
+			Rooms.get('staff').add('|html|' + text).update();
 		}
 	},
 	debug: function (text) {
-		if (Config.loglevel <= 1) console.log(text);
+		// console.log(text);
 	},
 	warn: function (text) {
-		if (Config.loglevel <= 3) console.log(text);
+		console.log(text);
 	},
 	notice: function (text) {
-		if (Config.loglevel <= 2) console.log(text);
+		console.log(text);
 	},
 
 	/*********************************************************
 	 * Resource Monitor
 	 *********************************************************/
 
-	clean: function () {
-		Monitor.clearNetworkUse();
-		Monitor.battlePreps.clear();
-		Monitor.battles.clear();
-		Monitor.connections.clear();
-		Dnsbl.cache.clear();
-	},
-	connections: new TimedCounter(),
-	battles: new TimedCounter(),
-	battlePreps: new TimedCounter(),
-	groupChats: new TimedCounter(),
+	connections: {},
+	connectionTimes: {},
+	battles: {},
+	battleTimes: {},
+	battlePreps: {},
+	battlePrepTimes: {},
+	groupChats: {},
+	groupChatTimes: {},
 	networkUse: {},
 	networkCount: {},
-	hotpatchLock: false,
+	cmds: {},
+	cmdsTimes: {},
+	cmdsTotal: {lastCleanup: Date.now(), count: 0},
+	teamValidatorChanged: 0,
+	teamValidatorUnchanged: 0,
 	/**
 	 * Counts a connection. Returns true if the connection should be terminated for abuse.
 	 */
 	countConnection: function (ip, name) {
-		let val = this.connections.increment(ip, 30 * 60 * 1000);
-		let count = val[0], duration = val[1];
+		var now = Date.now();
+		var duration = now - this.connectionTimes[ip];
 		name = (name ? ': ' + name : '');
-		if (count === 500) {
-			this.adminlog('[ResourceMonitor] IP ' + ip + ' banned for cflooding (' + count + ' times in ' + Chat.toDurationString(duration) + name + ')');
-			return true;
-		} else if (count > 500) {
-			if (count % 500 === 0) {
-				let c = count / 500;
-				if (c === 2 || c === 4 || c === 10 || c === 20 || c % 40 === 0) {
-					this.adminlog('[ResourceMonitor] IP ' + ip + ' still cflooding (' + count + ' times in ' + Chat.toDurationString(duration) + name + ')');
+		if (ip in this.connections && duration < 30 * 60 * 1000) {
+			this.connections[ip]++;
+			if (this.connections[ip] === 500) {
+				this.adminlog('[ResourceMonitor] IP ' + ip + ' has been banned for connection flooding (' + this.connections[ip] + ' times in the last ' + duration.duration() + name + ')');
+				return true;
+			} else if (this.connections[ip] > 500) {
+				if (this.connections[ip] % 500 === 0) {
+					var c = this.connections[ip] / 500;
+					if (c < 5 || c % 2 === 0 && c < 10 || c % 5 === 0) {
+						this.adminlog('[ResourceMonitor] Banned IP ' + ip + ' has connected ' + this.connections[ip] + ' times in the last ' + duration.duration() + name);
+					}
 				}
+				return true;
 			}
-			return true;
+		} else {
+			this.connections[ip] = 1;
+			this.connectionTimes[ip] = now;
 		}
 	},
 	/**
 	 * Counts a battle. Returns true if the connection should be terminated for abuse.
 	 */
 	countBattle: function (ip, name) {
-		let val = this.battles.increment(ip, 30 * 60 * 1000);
-		let count = val[0], duration = val[1];
+		var now = Date.now();
+		var duration = now - this.battleTimes[ip];
 		name = (name ? ': ' + name : '');
-		if (duration < 5 * 60 * 1000 && count % 30 === 0) {
-			this.adminlog('[ResourceMonitor] IP ' + ip + ' has battled ' + count + ' times in the last ' + Chat.toDurationString(duration) + name);
-		} else if (count % 150 === 0) {
-			this.adminlog('[ResourceMonitor] IP ' + ip + ' has battled ' + count + ' times in the last ' + Chat.toDurationString(duration) + name);
+		if (ip in this.battles && duration < 30 * 60 * 1000) {
+			this.battles[ip]++;
+			if (duration < 5 * 60 * 1000 && this.battles[ip] % 15 === 0) {
+				this.log('[ResourceMonitor] IP ' + ip + ' has battled ' + this.battles[ip] + ' times in the last ' + duration.duration() + name);
+			} else if (this.battles[ip] % 75 === 0) {
+				this.log('[ResourceMonitor] IP ' + ip + ' has battled ' + this.battles[ip] + ' times in the last ' + duration.duration() + name);
+			}
+		} else {
+			this.battles[ip] = 1;
+			this.battleTimes[ip] = now;
 		}
 	},
 	/**
 	 * Counts battle prep. Returns true if too much
 	 */
-	countPrepBattle: function (ip, connection) {
-		let count = this.battlePreps.increment(ip, 3 * 60 * 1000)[0];
-		if (count > 12) {
-			if (Punishments.sharedIps.has(ip) && count < 120) return;
-			connection.popup(`Due to high load, you are limited to 12 battles and team validations every 3 minutes.`);
-			return true;
-		}
-	},
-	/**
-	 * Counts concurrent battles. Returns true if too much
-	 */
-	countConcurrentBattle: function (count, connection) {
-		if (count > 5) {
-			connection.popup(`Due to high load, you are limited to 5 games at the same time.`);
-			return true;
+	countPrepBattle: function (ip) {
+		var now = Date.now();
+		var duration = now - this.battlePrepTimes[ip];
+		if (ip in this.battlePreps && duration < 3 * 60 * 1000) {
+			this.battlePreps[ip]++;
+			if (this.battlePreps[ip] > 6) {
+				return true;
+			}
+		} else {
+			this.battlePreps[ip] = 1;
+			this.battlePrepTimes[ip] = now;
 		}
 	},
 	/**
 	 * Counts group chat creation. Returns true if too much.
 	 */
 	countGroupChat: function (ip) {
-		let count = this.groupChats.increment(ip, 60 * 60 * 1000)[0];
-		if (count > 4) return true;
+		var now = Date.now();
+		var duration = now - this.groupChatTimes[ip];
+		if (ip in this.groupChats && duration < 60 * 60 * 1000) {
+			this.groupChats[ip]++;
+			if (this.groupChats[ip] > 4) {
+				return true;
+			}
+		} else {
+			this.groupChats[ip] = 1;
+			this.groupChatTimes[ip] = now;
+		}
 	},
 	/**
 	 * data
 	 */
 	countNetworkUse: function (size) {
-		if (Config.emergency) {
-			if (this.activeIp in this.networkUse) {
-				this.networkUse[this.activeIp] += size;
-				this.networkCount[this.activeIp]++;
-			} else {
-				this.networkUse[this.activeIp] = size;
-				this.networkCount[this.activeIp] = 1;
-			}
+		if (this.activeIp in this.networkUse) {
+			this.networkUse[this.activeIp] += size;
+			this.networkCount[this.activeIp]++;
+		} else {
+			this.networkUse[this.activeIp] = size;
+			this.networkCount[this.activeIp] = 1;
 		}
 	},
 	writeNetworkUse: function () {
-		let buf = '';
-		for (let i in this.networkUse) {
+		var buf = '';
+		for (var i in this.networkUse) {
 			buf += '' + this.networkUse[i] + '\t' + this.networkCount[i] + '\t' + i + '\n';
 		}
-		fs.writeFile(path.resolve(__dirname, 'logs/networkuse.tsv'), buf, () => {});
+		fs.writeFile(path.resolve(__dirname, 'logs/networkuse.tsv'), buf);
 	},
 	clearNetworkUse: function () {
-		if (Config.emergency) {
-			this.networkUse = {};
-			this.networkCount = {};
-		}
+		this.networkUse = {};
+		this.networkCount = {};
 	},
 	/**
 	 * Counts roughly the size of an object to have an idea of the server load.
 	 */
 	sizeOfObject: function (object) {
-		let objectList = [];
-		let stack = [object];
-		let bytes = 0;
+		var objectList = [];
+		var stack = [object];
+		var bytes = 0;
 
 		while (stack.length) {
-			let value = stack.pop();
+			var value = stack.pop();
 			if (typeof value === 'boolean') {
 				bytes += 4;
 			} else if (typeof value === 'string') {
 				bytes += value.length * 2;
 			} else if (typeof value === 'number') {
 				bytes += 8;
-			} else if (typeof value === 'object' && !objectList.includes(value)) {
+			} else if (typeof value === 'object' && objectList.indexOf(value) < 0) {
 				objectList.push(value);
-				for (let i in value) stack.push(value[i]);
+				for (var i in value) stack.push(value[i]);
 			}
 		}
 
 		return bytes;
 	},
+	/**
+	 * Controls the amount of times a cmd command is used
+	 */
+	countCmd: function (ip, name) {
+		var now = Date.now();
+		var duration = now - this.cmdsTimes[ip];
+		name = (name ? ': ' + name : '');
+		if (!this.cmdsTotal) this.cmdsTotal = {lastCleanup: 0, count: 0};
+		if (now - this.cmdsTotal.lastCleanup > 60 * 1000) {
+			this.cmdsTotal.count = 0;
+			this.cmdsTotal.lastCleanup = now;
+		}
+		this.cmdsTotal.count++;
+		if (ip in this.cmds && duration < 60 * 1000) {
+			this.cmds[ip]++;
+			if (duration < 60 * 1000 && this.cmds[ip] % 5 === 0) {
+				if (this.cmds[ip] >= 3) {
+					if (this.cmds[ip] % 30 === 0) this.log('CMD command from ' + ip + ' blocked for ' + this.cmds[ip] + 'th use in the last ' + duration.duration() + name);
+					return true;
+				}
+				this.log('[ResourceMonitor] IP ' + ip + ' has used CMD command ' + this.cmds[ip] + ' times in the last ' + duration.duration() + name);
+			} else if (this.cmds[ip] % 15 === 0) {
+				this.log('CMD command from ' + ip + ' blocked for ' + this.cmds[ip] + 'th use in the last ' + duration.duration() + name);
+				return true;
+			}
+		} else if (this.cmdsTotal.count > 8000) {
+			// One CMD check per user per minute on average (to-do: make this better)
+			this.log('CMD command for ' + ip + ' blocked because CMD has been used ' + this.cmdsTotal.count + ' times in the last minute.');
+			return true;
+		} else {
+			this.cmds[ip] = 1;
+			this.cmdsTimes[ip] = now;
+		}
+	}
 };
-
-Monitor.cleanInterval = setInterval(() => Monitor.clean(), 2 * 60 * 60 * 1000);

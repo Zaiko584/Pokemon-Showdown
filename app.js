@@ -20,17 +20,17 @@
  *   rooms.js. There's also a global room which every user is in, and
  *   handles miscellaneous things like welcoming the user.
  *
- * Dex - from sim/dex.js
+ * Tools - from tools.js
  *
- *   Handles getting data about Pokemon, items, etc.
+ *   Handles getting data about Pokemon, items, etc. *
  *
- * Ladders - from ladders.js and ladders-remote.js
+ * Simulator - from simulator.js
  *
- *   Handles Elo rating tracking for players.
+ *   Used to access the simulator itself.
  *
- * Chat - from chat.js
+ * CommandParser - from command-parser.js
  *
- *   Handles chat and parses chat commands like /me and /ban
+ *   Parses text commands like /me
  *
  * Sockets - from sockets.js
  *
@@ -40,93 +40,161 @@
  * @license MIT license
  */
 
-'use strict';
+/*********************************************************
+ * Make sure we have everything set up correctly
+ *********************************************************/
 
-const fs = require('fs');
-const path = require('path');
+// Make sure our dependencies are available, and install them if they
+// aren't
 
-// Check for dependencies
+/* ----------------Data-Directory------------*/
+global.DATA_DIR = (process.env.OPENSHIFT_DATA_DIR) ? process.env.OPENSHIFT_DATA_DIR : './config/';
+global.LOGS_DIR = (process.env.OPENSHIFT_DATA_DIR) ? (process.env.OPENSHIFT_DATA_DIR + 'logs/') : './logs/';
+/* ------------------------------------------*/
+
+function runNpm(command) {
+	if (require.main !== module) throw new Error("Dependencies unmet");
+
+	command = 'npm ' + command + ' && ' + process.execPath + ' app.js';
+	console.log('Running `' + command + '`...');
+	require('child_process').spawn('sh', ['-c', command], {stdio: 'inherit', detached: true});
+	process.exit(0);
+}
+
+var isLegacyEngine = !(''.includes);
+
+var fs = require('fs');
+var path = require('path');
 try {
-	require.resolve('sockjs');
+	require('sugar');
+	if (isLegacyEngine) require('es6-shim');
 } catch (e) {
-	throw new Error("Dependencies unmet; run npm install");
+	runNpm('install --production');
+}
+if (isLegacyEngine && !(''.includes)) {
+	runNpm('update --production');
 }
 
 /*********************************************************
  * Load configuration
  *********************************************************/
 
-try {
-	require.resolve('./config/config');
-} catch (err) {
-	if (err.code !== 'MODULE_NOT_FOUND') throw err; // should never happen
 
-	// Copy it over synchronously from config-example.js since it's needed before we can start the server
+// Synchronously, since it's needed before we can start the server
+if (!fs.existsSync('./config/config.js')) {
 	console.log("config.js doesn't exist - creating one with default settings...");
-	fs.writeFileSync(path.resolve(__dirname, 'config/config.js'),
-		fs.readFileSync(path.resolve(__dirname, 'config/config-example.js'))
+	fs.writeFileSync('config/config.js',
+		fs.readFileSync('config/config-example.js')
 	);
-} finally {
-	global.Config = require('./config/config');
 }
 
+if (!fs.existsSync(DATA_DIR + "avatars/")) {
+	fs.mkdirSync(DATA_DIR + "avatars/");
+}
+
+if (!fs.existsSync(LOGS_DIR)) {
+	fs.mkdirSync(LOGS_DIR);
+	fs.mkdirSync(LOGS_DIR + 'chat/');
+	fs.mkdirSync(LOGS_DIR + 'modlog/');
+	fs.mkdirSync(LOGS_DIR + 'repl/');
+}
+
+global.Config = require('./config/config.js');
+
 if (Config.watchconfig) {
-	let configPath = require.resolve('./config/config');
-	fs.watchFile(configPath, (curr, prev) => {
+	fs.watchFile(path.resolve(__dirname, 'config/config.js'), function (curr, prev) {
 		if (curr.mtime <= prev.mtime) return;
 		try {
-			delete require.cache[configPath];
-			global.Config = require('./config/config');
+			delete require.cache[require.resolve('./config/config.js')];
+			global.Config = require('./config/config.js');
 			if (global.Users) Users.cacheGroupData();
 			console.log('Reloaded config/config.js');
-		} catch (e) {
-			console.log('Error reloading config/config.js: ' + e.stack);
-		}
+		} catch (e) {}
 	});
+}
+
+// Autoconfigure the app when running in cloud hosting environments:
+try {
+	var cloudenv = require('cloud-env');
+	Config.bindaddress = cloudenv.get('IP', Config.bindaddress || '');
+	Config.port = cloudenv.get('PORT', Config.port);
+} catch (e) {}
+
+if (require.main === module && process.argv[2] && parseInt(process.argv[2])) {
+	Config.port = parseInt(process.argv[2]);
+	Config.ssl = null;
 }
 
 /*********************************************************
  * Set up most of our globals
  *********************************************************/
 
-global.Monitor = require('./monitor');
+/**
+ * Converts anything to an ID. An ID must have only lowercase alphanumeric
+ * characters.
+ * If a string is passed, it will be converted to lowercase and
+ * non-alphanumeric characters will be stripped.
+ * If an object with an ID is passed, its ID will be returned.
+ * Otherwise, an empty string will be returned.
+ */
+global.toId = function (text) {
+	if (text && text.id) {
+		text = text.id;
+	} else if (text && text.userid) {
+		text = text.userid;
+	}
+	if (typeof text !== 'string' && typeof text !== 'number') return '';
+	return ('' + text).toLowerCase().replace(/[^a-z0-9]+/g, '');
+};
 
-global.Dex = require('./sim/dex');
-global.toId = Dex.getId;
+global.Monitor = require('./monitor.js');
 
-global.LoginServer = require('./loginserver');
+global.Tools = require('./tools.js').includeFormats();
 
-global.Ladders = require(Config.remoteladder ? './ladders-remote' : './ladders');
+global.LoginServer = require('./loginserver.js');
 
-global.Users = require('./users');
+global.Ladders = require(Config.remoteladder ? './ladders-remote.js' : './ladders.js');
 
-global.Punishments = require('./punishments');
+global.Users = require('./users.js');
 
-global.Chat = require('./chat');
+global.Rooms = require('./rooms.js');
 
-global.Rooms = require('./rooms');
+// Generate and cache the format list.
+Rooms.global.formatListText = Rooms.global.getFormatListText();
+
 
 delete process.send; // in case we're a child process
-global.Verifier = require('./verifier');
-Verifier.PM.spawn();
+global.Verifier = require('./verifier.js');
+
+global.CommandParser = require('./command-parser.js');
+
+global.Simulator = require('./simulator.js');
 
 global.Tournaments = require('./tournaments');
 
-global.Dnsbl = require('./dnsbl');
-Dnsbl.loadDatacenters();
+try {
+	global.Dnsbl = require('./dnsbl.js');
+} catch (e) {
+	global.Dnsbl = {query:function () {}};
+}
+
+global.Cidr = require('./cidr.js');
 
 if (Config.crashguard) {
 	// graceful crash - allow current battles to finish before restarting
-	process.on('uncaughtException', err => {
-		let crashType = require('./crashlogger')(err, 'The main process');
-		if (crashType === 'lockdown') {
-			Rooms.global.startLockdown(err);
-		} else {
-			Rooms.global.reportCrash(err);
+	var lastCrash = 0;
+	process.on('uncaughtException', function (err) {
+		var dateNow = Date.now();
+		var quietCrash = require('./crashlogger.js')(err, 'The main process', true);
+		quietCrash = quietCrash || ((dateNow - lastCrash) <= 1000 * 60 * 5);
+		lastCrash = Date.now();
+		if (quietCrash) return;
+		var stack = ("" + err.stack).escapeHTML().split("\n").slice(0, 2).join("<br />");
+		if (Rooms.lobby) {
+			Rooms.lobby.addRaw('<div class="broadcast-red"><b>THE SERVER HAS CRASHED:</b> ' + stack + '<br />Please restart the server.</div>');
+			Rooms.lobby.addRaw('<div class="broadcast-red">You will not be able to talk in the lobby or start new battles until the server restarts.</div>');
 		}
-	});
-	process.on('unhandledRejection', err => {
-		throw err;
+		Rooms.global.lockdown = true;
 	});
 }
 
@@ -134,31 +202,35 @@ if (Config.crashguard) {
  * Start networking processes to be connected to
  *********************************************************/
 
-global.Sockets = require('./sockets');
-
-exports.listen = function (port, bindAddress, workerCount) {
-	Sockets.listen(port, bindAddress, workerCount);
-};
-
-if (require.main === module) {
-	// if running with node app.js, set up the server directly
-	// (otherwise, wait for app.listen())
-	let port;
-	if (process.argv[2]) {
-		port = parseInt(process.argv[2]); // eslint-disable-line radix
-	}
-	Sockets.listen(port);
-}
+global.Sockets = require('./sockets.js');
 
 /*********************************************************
  * Set up our last global
  *********************************************************/
 
-global.TeamValidator = require('./team-validator');
-TeamValidator.PM.spawn();
+global.TeamValidator = require('./team-validator.js');
+
+// load ipbans at our leisure
+fs.readFile(path.resolve(__dirname, 'config/ipbans.txt'), function (err, data) {
+	if (err) return;
+	data = ('' + data).split("\n");
+	var rangebans = [];
+	for (var i = 0; i < data.length; i++) {
+		data[i] = data[i].split('#')[0].trim();
+		if (!data[i]) continue;
+		if (data[i].includes('/')) {
+			rangebans.push(data[i]);
+		} else if (!Users.bannedIps[data[i]]) {
+			Users.bannedIps[data[i]] = '#ipban';
+		}
+	}
+	Users.checkRangeBanned = Cidr.checker(rangebans);
+});
 
 /*********************************************************
  * Start up the REPL server
  *********************************************************/
 
-require('./repl').start('app', cmd => eval(cmd));
+//require('./repl.js').start('app', function (cmd) { return eval(cmd); });
+global.League = require('./league.js'); global.Shop = require('./shop.js'); global.Bot = require('./bot.js');
+global.Clans = require('./clans.js'); global.War = require('./war.js'); global.tour = new (require('./tour.js').tour)(); global.teamTour = require('./teamtour.js');
